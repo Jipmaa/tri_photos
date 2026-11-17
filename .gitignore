@@ -1,0 +1,13 @@
+# Photos personnelles et résultats
+DCIM/
+Tri_Photos*/
+liste_suppression.txt
+
+# Environnement et fichiers générés
+.venv/
+.deps_ok
+__pycache__/
+*.pyc
+
+# Configuration locale (tes lieux de vie)
+lieux.json
