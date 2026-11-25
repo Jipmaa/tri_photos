@@ -53,7 +53,7 @@ function Installer-Dependances($py) {
     }
     if ($LASTEXITCODE -ne 0) { throw "Échec de l'installation de PyTorch." }
 
-    & $py -m pip install pillow pillow-heif imagehash opencv-python reverse_geocoder numpy open_clip_torch
+    & $py -m pip install pillow pillow-heif imagehash opencv-python reverse_geocoder numpy open_clip_torch send2trash
     if ($LASTEXITCODE -ne 0) { throw "Échec de l'installation des dépendances." }
 
     New-Item -ItemType File -Force (Join-Path $PSScriptRoot ".deps_ok") | Out-Null
@@ -98,6 +98,17 @@ try {
         Installer-Dependances $py
     }
 
+    # 4bis. send2trash est nécessaire à l'interface (installation ajoutée après coup)
+    $ancien = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $py -c "import send2trash" *> $null
+    $manque = $LASTEXITCODE -ne 0
+    $ErrorActionPreference = $ancien
+    if ($manque) {
+        Write-Host "Installation de send2trash..." -ForegroundColor Cyan
+        & $py -m pip install send2trash
+    }
+
     # 5. Lieux de vie
     $lieux = Join-Path $PSScriptRoot "lieux.json"
     if (-not (Test-Path $lieux)) {
@@ -111,6 +122,14 @@ try {
     # 6. Tri
     Write-Host "`nLancement du tri..." -ForegroundColor Cyan
     & $py (Join-Path $PSScriptRoot "tri_photos.py") "DCIM" "Tri_Photos"
+
+    # 7. Interface de révision
+    if (Test-Path (Join-Path $PSScriptRoot "Tri_Photos")) {
+        $rep = Read-Host "`nOuvrir l'interface de révision maintenant ? [O/n]"
+        if ($rep -eq "" -or $rep -match "^[oOyY]") {
+            & $py (Join-Path $PSScriptRoot "interface_tri.py")
+        }
+    }
 }
 catch {
     Write-Host "`nERREUR : $($_.Exception.Message)" -ForegroundColor Red

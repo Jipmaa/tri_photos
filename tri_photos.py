@@ -27,6 +27,8 @@ from datetime import datetime, timedelta
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 
+from manifeste import charger as charger_manifeste, sauver as sauver_manifeste
+
 import cv2
 import imagehash
 import numpy as np
@@ -63,6 +65,7 @@ UTILE = ["a photo of a person", "a photo of a landscape or nature",
          "a photo of a building or monument", "a photo of a city street",
          "a photo of friends or family together"]
 LABELS = INUTILE + UTILE
+CLE_LABELS = "|".join(LABELS)  # détecte un changement de libellés CLIP
 
 POP = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
@@ -116,6 +119,51 @@ def haversine(a, b):
 
 # ---------- Analyse (exécutée en parallèle sur les cœurs CPU) ----------
 
+CHAMPS_CACHE = ["phash", "nettete", "pixels", "taille", "camera", "luminosite", "gps", "date_exif"]
+CACHE = {}
+
+
+def init_worker(cache):
+    """Appelé une fois par processus : chaque worker connaît le cache."""
+    global CACHE
+    CACHE = cache
+
+
+def vers_cache(r):
+    c = {k: r.get(k) for k in CHAMPS_CACHE}
+    c["taille"] = list(r["taille"])
+    c["gps"] = list(r["gps"]) if r["gps"] else None
+    c["date_exif"] = r["date_exif"].isoformat() if r["date_exif"] else None
+    return c
+
+
+def depuis_cache(c, r):
+    for k in CHAMPS_CACHE:
+        r[k] = c.get(k)
+    r["taille"] = tuple(c["taille"]) if c.get("taille") else (0, 0)
+    r["gps"] = tuple(c["gps"]) if c.get("gps") else None
+    r["date_exif"] = datetime.fromisoformat(c["date_exif"]) if c.get("date_exif") else None
+
+
+def calculer_image(p, r):
+    try:
+        with Image.open(p) as im:
+            exif = im.getexif()
+            r["date_exif"] = date_exif(exif)
+            r["gps"] = gps_exif(exif)
+            r["pixels"] = im.width * im.height
+            r["taille"] = (im.width, im.height)
+            r["camera"] = bool(exif.get(271))  # 271 = marque de l'appareil
+            rgb = im.convert("RGB")
+        rgb.thumbnail((1024, 1024))
+        r["phash"] = str(imagehash.phash(rgb))
+        gris = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2GRAY)
+        r["luminosite"] = float(gris.mean())
+        r["nettete"] = float(cv2.Laplacian(gris, cv2.CV_64F).var())
+    except Exception:
+        pass
+
+
 def analyser(chemin):
     p = Path(chemin)
     r = {"path": chemin, "ext": p.suffix.lower(), "sha": None, "phash": None,
@@ -134,26 +182,12 @@ def analyser(chemin):
                         datetime.fromtimestamp(st.st_mtime))
     except OSError:
         return r
-    if r["ext"] in VID_EXT:
-        return r
-    try:
-        with Image.open(p) as im:
-            exif = im.getexif()
-            r["date_exif"] = date_exif(exif)
-            if r["date_exif"]:
-                r["date"] = r["date_exif"]
-            r["gps"] = gps_exif(exif)
-            r["pixels"] = im.width * im.height
-            r["taille"] = (im.width, im.height)
-            r["camera"] = bool(exif.get(271))  # 271 = marque de l'appareil
-            rgb = im.convert("RGB")
-        rgb.thumbnail((1024, 1024))
-        r["phash"] = str(imagehash.phash(rgb))
-        gris = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2GRAY)
-        r["luminosite"] = float(gris.mean())
-        r["nettete"] = float(cv2.Laplacian(gris, cv2.CV_64F).var())
-    except Exception:
-        pass
+    if r["sha"] in CACHE:
+        depuis_cache(CACHE[r["sha"]], r)
+    elif r["ext"] not in VID_EXT:
+        calculer_image(p, r)
+    if r["date_exif"]:
+        r["date"] = r["date_exif"]
     return r
 
 
@@ -410,14 +444,28 @@ def main():
         DIST_VOYAGE_KM, LIEUX_DE_VIE = charger_config()
     sortie.mkdir(parents=True, exist_ok=True)
 
+    # Manifeste et cache
+    data = charger_manifeste(sortie, src)
+    if data.get("labels") != CLE_LABELS:
+        for c in data["cache"].values():
+            c.pop("clip", None)
+        data["labels"] = CLE_LABELS
+    cache = data["cache"]
+
     fichiers = [str(p) for p in src.rglob("*")
                 if p.suffix.lower() in IMG_EXT | VID_EXT and sortie not in p.parents]
     print(f"{len(fichiers)} fichiers trouvés, analyse en cours...")
 
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as ex:
+    with ProcessPoolExecutor(max_workers=os.cpu_count(),
+                             initializer=init_worker, initargs=(cache,)) as ex:
         recs = list(ex.map(analyser, fichiers, chunksize=32))
 
-    # 1. Doublons exacts : on ne garde qu'un représentant par contenu
+    # Mise en cache des nouvelles photos
+    for r in recs:
+        if r["sha"] and r["sha"] not in cache:
+            cache[r["sha"]] = vers_cache(r)
+
+    # 1. Doublons exacts : un représentant par contenu
     par_sha = defaultdict(list)
     for r in recs:
         if r["sha"]:
@@ -425,15 +473,24 @@ def main():
     reps = [v[0] for v in par_sha.values()]
     imgs = [r for r in reps if r["ext"] in IMG_EXT]
 
-    # 2. IA : probabilité « inutile »
-    print("Classification IA...")
+    # 2. IA : seules les images jamais analysées sont envoyées au GPU
+    a_calculer = [r for r in imgs if "clip" not in cache[r["sha"]]]
+    if a_calculer:
+        print(f"Classification IA : {len(a_calculer)} nouvelles images "
+              f"sur {len(imgs)}")
+        for r, pr in zip(a_calculer, scorer_clip(a_calculer, device)):
+            cache[r["sha"]]["clip"] = pr
+    else:
+        print("Classification IA : toutes les images sont déjà en cache.")
     for r in imgs:
-        r["p_inutile"] = 0.0
-        r["p_sujet"] = 0.0
-    for r, pr in zip(imgs, scorer_clip(imgs, device)):
+        pr = cache[r["sha"]]["clip"]
         r["p_inutile"] = sum(pr[:len(INUTILE)])
         # les 3 premiers libellés « utile » : personne, paysage, animal
         r["p_sujet"] = max(pr[len(INUTILE):len(INUTILE) + 3])
+
+    # Le cache est sauvegardé même en simulation
+    data["cache"] = cache
+    sauver_manifeste(data, sortie, src)
 
     # 3. Quasi-doublons
     groupes_quasi = trouver_groupes([r for r in imgs if r["phash"]], a.seuil_doublon)
@@ -456,17 +513,18 @@ def main():
             extras.append((d, "A_verifier/doublons_exacts"))
             notes[cible].append(("exact", d["path"]))
 
-    # 4. Placement des photos restantes
+    # 4. Placement
     extras_set = {r["path"] for r, _ in extras}
     restantes = [r for r in reps if r["path"] not in extras_set]
 
     def est_inutile(r):
         return r.get("p_inutile", 0) >= a.seuil_inutile
-    
-    candidats = [r for r in restantes
-                 if not (est_inutile(r) or est_sombre(r) or est_aiselect(r)
-                         or est_capture(r) or est_snap_clip(r) or r["wa"])]
-    voyages, periodes = trouver_voyages(candidats)
+
+    voyages, periodes = trouver_voyages([
+        r for r in restantes
+        if not (est_inutile(r) or est_sombre(r) or est_aiselect(r)
+                or est_capture(r) or est_snap_clip(r) or r["wa"])
+    ])
 
     plan = list(extras)
     for r in restantes:
@@ -494,7 +552,6 @@ def main():
             d = "Autres"
         plan.append((r, d))
 
-    dossier_de = {r["path"]: d for r, d in plan}
     print("\nRésumé :")
     for cle, n in Counter(d.split("/")[0] + "/" + d.split("/")[1]
                           if "/" in d else d for _, d in plan).most_common():
@@ -506,7 +563,8 @@ def main():
         print(f"\nSimulation terminée. Voir {sortie / 'rapport_doublons.html'}")
         return
 
-    # 5. Copie ou déplacement (les métadonnées ne sont pas modifiées)
+    # 5. Copie ou déplacement, et enregistrement du classement
+    data["photos"] = {}  # le classement correspond à ce tri
     dest_de = {}
     for r, d in plan:
         dest_dir = sortie / d
@@ -514,6 +572,12 @@ def main():
         dest = unique(dest_dir / Path(r["path"]).name)
         (shutil.move if a.deplacer else shutil.copy2)(r["path"], dest)
         dest_de[r["path"]] = dest
+        if not d.startswith("A_verifier/doublons"):
+            data["photos"][r["sha"]] = {
+                "fichier": dest.relative_to(sortie).as_posix(),
+                "dossier": d,
+            }
+    sauver_manifeste(data, sortie, src)
 
     # 6. Fichier « à ne pas supprimer » dans le dossier de la meilleure photo
     for chemin, lignes in notes.items():
@@ -525,7 +589,6 @@ def main():
             f.write("\n")
 
     print(f"\nTerminé. Ouvre {sortie / 'rapport_doublons.html'} pour comparer les doublons.")
-
 
 if __name__ == "__main__":
     main()
